@@ -1,4 +1,6 @@
 import argparse  # ← 追加
+import os  # ← 環境変数取得のために追加
+import sys
 import time
 import RPi.GPIO as GPIO
 from grogu_controller import CatRobotController
@@ -12,7 +14,13 @@ if __name__ == "__main__":
     robot = None
     try:
         print("\n--- 1. ロボットコントローラーの初期化 ---")
-        API_KEY = "AIzaSyA594srtfXCbUOUejm4YEInVEm-8YwWgVg"
+        
+        # ── 環境変数からの API キー取得 ──
+        API_KEY = os.environ.get("GEMINI_API_KEY")
+        if not API_KEY:
+            print("❌ エラー: 環境変数 'GEMINI_API_KEY' が設定されていません。")
+            print("実行前に export GEMINI_API_KEY=\"あなたのAPIキー\" を実行するか、.bashrc に設定してください。")
+            sys.exit(1)
         
         # ── 2. 引数の有無（True/False）をコントローラーに渡す ──
         robot = CatRobotController(gemini_api_key=API_KEY, use_mic=False, remote_only_mode=args.remote_only, enable_proactive=True)
