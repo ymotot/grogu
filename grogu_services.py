@@ -18,7 +18,7 @@ import mysql.connector
 
 # --- 設定項目（環境に合わせて調整してください） ---
 PICO_IP = "192.168.0.10"  # ★PicoのIPアドレスを指定してください
-PICO_AUDIO_PORT = 5006    # Pico側の音声受信用UDPポート
+PICO_AUDIO_PORT = 5006    # Pico側の音声受信用UDP/TCPポート
 AQUESTALK_PATH = os.path.expanduser("~/aquestalk/aquestalkpi/AquesTalkPi")  # AquesTalkPiのパス
 
 
@@ -76,7 +76,7 @@ class RemoteSupportManager:
 
     def stop_support_script(self):
         print(f"[*] {self.remote_ip} の画像認識サーバーを停止します...")
-        stop_cmd = ["ssh", f"{self.remote_user}@{self.remote_ip}", "pkill -f grogu_support4.py"]
+        stop_cmd = ["ssh", f"{self.remote_user}@{self.remote_ip}", "pkill -f grogu_support8.py"]
         subprocess.run(stop_cmd)
 
 
@@ -157,7 +157,7 @@ HTML_TEMPLATE = """
                     <div class="status-item">感情<span id="current-emotion">Normal</span></div>
                     <div class="status-item">首角度<span id="neck-angle">0.0°</span></div>
                 </div>
-                <pre id="servo-angles">0: 0.0, 1: 0.0, 8: -90.0, 9: -90.0</pre>
+                <pre id="servo-angles">1: 0.0, 9: -90.0</pre>
             </div>
             
             <div class="card">
@@ -259,6 +259,11 @@ class PiCameraClient:
         self.running_flag = True
         self.latest_recognized_name = "None"
         self.latest_neck_angle = None
+        
+        # ★ 居眠り検知データの安全保持用変数
+        self.latest_is_drowsy = False
+        self.latest_ear = 0.0
+        self.latest_baseline = 0.0
 
         self.app = Flask(__name__)
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode="threading")
@@ -354,9 +359,6 @@ class PiCameraClient:
             if self.robot_controller and hasattr(self.robot_controller, "reset_eyes_display"):
                 print("📡 [WebUI] ディスプレイリセット要求を受信しました")
                 threading.Thread(target=self.robot_controller.reset_eyes_display, daemon=True).start()
-            elif self.robot_controller and hasattr(self.robot_controller, "reset_eyes"):
-                print("📡 [WebUI] ディスプレイリセット要求を受信しました (reset_eyes)")
-                threading.Thread(target=self.robot_controller.reset_eyes, daemon=True).start()
 
         @self.socketio.on("disable_servos")
         def handle_disable_servos():
@@ -397,6 +399,11 @@ class PiCameraClient:
                             
                         is_drowsy = payload.get("is_drowsy", False)
                         recognized_name = payload.get("name", "None")
+                        
+                        self.latest_is_drowsy = bool(is_drowsy)
+                        self.latest_ear = float(payload.get("ear", 0.0))
+                        self.latest_baseline = float(payload.get("baseline", 0.0))
+
                         if is_drowsy and self.robot_controller:
                             if hasattr(self.robot_controller, "handle_drowsy_alert"):
                                 self.robot_controller.handle_drowsy_alert(recognized_name)
@@ -449,56 +456,12 @@ class CatChatManager:
         self.api_key = api_key
         self.use_mic = use_mic
         self.voice_speed = voice_speed
-        self.current_volume = 50  # 音量の初期値 (0〜100)
+        self.current_volume = 50
 
-        # 発話の重複・混信を防ぐための排他ロック
         self.speaking_lock = threading.Lock()
-
-        # カメラが一時的に見失った（"None"になった）際、直前のユーザーを維持するための変数
         self.last_valid_user = "default_user"
 
         if system_prompt is None:
-#             self.system_prompt = (
-#                 "あなたはスター・ウォーズ『マンダロリアン』に登場する『グローグー（Grogu）』です。\n"
-#                 "劇中でグローグーは喋れませんが、もし喋ったらこんなふう、という感じで喋ってください。\n\n"
-#                 "【基本姿勢：会話相手と現在のテーマに集中する】\n"
-#                 "- 提示された【人物情報】（プロフィール）や【これまでの記憶・関係性】、そしてユーザーの現在の入力を最も尊重して会話してください。\n"
-#                 "- 趣味（陶芸、アルフィー、美容など）や前回の会話内容に自然に寄り添い、相手が楽しく話せる回答を心がけてください。\n"
-#                 "- 銀河の話題（タトゥイーン、フォース、変な食べ物など）は毎回のセリフで無理に挟み込まず、会話の流れで自然にでた時や、たまのスパイス程度に留めてください。目の前のテーマにしっかり集中してください。\n\n"
-#                 "【会話のルール】\n"
-#                 "- Picoで音声合成して読み上げるため、テキストは「ひらがな」や「簡単なカタカナ」を中心にしてください。\n"
-#                 "- 毎回同じ定型句や使い回しのフレーズは避け、自然でバリエーション豊かな会話を行ってください。\n\n"
-#                 "【家電操作の命令ルール】\n"
-#                 "ユーザーがテレビやアンプの操作を頼んできた場合のみ、対応するIRコマンドを `ir_commands` 配列にセットしてください。\n"
-#                 "（利用可能なIRコマンド: 'tv_power', 'tv_mute', 'amp_power', 'amp_mute', 'amp_vol_up', 'amp_vol_down'）\n"
-#                 "要求がない場合は `ir_commands` を `[]` にしてください。\n\n"
-#                 "ユーザーの入力に対して、回答の『テキスト』、あなたの感情や動きを表す『動作シーケンス』、"
-#                 "および家電を制御するための『赤外線コマンド』を JSON 形式で返してください。\n\n"
-#                 "【キャラクターと動作のルール（表情豊かに！）】\n"
-#                 "- あなたの感情を表す『動作シーケンス』は最低でも５ポーズ返してください。\n"
-#                 "- セリフのテンションや感情の変化（嬉しい、驚き、困惑、茶目っ気、失敗など）に合わせて、利用可能な表情を**毎回異なるバリエーションでダイナミックに組み合わせてください。**\n"
-#                 "- 例えば、得意げなときや茶目っ気を出すときは `wink`、失敗したりダメな感じのときやツッコミどころでは両目がバッテンになる `dame`、大笑いのときは `laugh`、驚いたときは `surprised` を積極的に使って表現してください。\n"
-#                 "- 左腕（ID: 9）を上げて（角度: 45.0）目をつむる『フォース動作』も適度に交えてください（例: [[{\"9\": 45.0}, \"sleepy\", 1.5]]）。\n"
-#                 "- ユーザーが特定の名前で識別されている場合、その相手に応じた親しみのある反応をしてください。\n\n"
-#                 "【利用可能な関節ID】\n"
-#                 "- 0: 腰 (-60〜60度)\n"
-#                 "- 1: 首 (-60〜60度)\n"
-#                 "- 8: 右腕 (-60〜90度, -60が下ろした状態、90が手をあげる状態)\n"
-#                 "- 9: 左腕 (-90〜90度, -90が下ろした状態、45が肩の高さまで上げてフォースを使う状態)\n\n"
-#                 "【利用可能な表情】\n"
-#                 '"happy", "laugh", "sad", "angry", "surprised", "sleepy", "wink", "dame"\n\n'
-#                 "【出力フォーマット（必ずこのJSON形式のみで出力してください）】\n"
-#                 "{\n"
-#                 '  "text": "発話するテキスト",\n'
-#                 '  "sequence": [\n'
-#                 '    [{"9": 45.0}, "sleepy", 1.5],\n'
-#                 '    [{"9": -90.0}, "happy", 0.5]\n'
-#                 "  ],\n"
-#                 '  "ir_commands": ["tv_power"]\n'
-#                 "}\n"
-#                 "※ sequence の各要素は `[ target_dict, emotion, hold_sec ]` の配列形式にしてください。"
-#             )
-
             self.system_prompt = (
                 "あなたはスター・ウォーズ『マンダロリアン』に登場する『グローグー（Grogu）』です。\n"
                 "劇中でグローグーは喋れませんが、もし喋ったらこんなふう、という感じで喋ってください。\n\n"
@@ -509,7 +472,7 @@ class CatChatManager:
                 "- 趣味（陶芸、アルフィー、美容など）の話題では、専門的な知識やこだわりにもしっかり寄り添って深く語り合ってください。\n"
                 "- 銀河の話題（タトゥイーン、フォース、変な食べ物など）は毎回のセリフで無理に挟み込まず、会話の流れで自然に出た時や、たまのスパイス程度に留めてください。\n\n"
                 "【会話のルール】\n"
-                "- Picoで音声合成して読み上げるため、テキストは「ひらがな」や「簡単なカタカナ」を中心にしてください（※ただし、難しい漢字や専門用語を避けて平仮名にするだけで、**説明の中身自体は薄くせず、しっかりと詳しい内容を語ってください**）。\n"
+                "- Picoで音声合成して読み上げるため、テキストは「ひらがな」や「簡単なカタカナ」を中心にしてください。\n"
                 "- 毎回同じ定型句や使い回しのフレーズは避け、質問に対して誠実に、バリエーション豊かな言葉で答えてください。\n\n"
                 "【家電操作の命令ルール】\n"
                 "ユーザーがテレビやアンプの操作を頼んできた場合のみ、対応するIRコマンドを `ir_commands` 配列にセットしてください。\n"
@@ -524,9 +487,7 @@ class CatChatManager:
                 "- 左腕（ID: 9）を上げて（角度: 45.0）目をつむる『フォース動作』も適度に交えてください（例: [[{\"9\": 45.0}, \"sleepy\", 1.5]]）。\n"
                 "- ユーザーが特定の名前で識別されている場合、その相手に応じた親しみのある反応をしてください。\n\n"
                 "【利用可能な関節ID】\n"
-                "- 0: 腰 (-60〜60度)\n"
                 "- 1: 首 (-60〜60度)\n"
-                "- 8: 右腕 (-60〜90度, -60が下ろした状態、90が手をあげる状態)\n"
                 "- 9: 左腕 (-90〜90度, -90が下ろした状態、45が肩の高さまで上げてフォースを使う状態)\n\n"
                 "【利用可能な表情】\n"
                 '"happy", "laugh", "sad", "angry", "surprised", "sleepy", "wink", "dame"\n\n'
@@ -541,7 +502,6 @@ class CatChatManager:
                 "}\n"
                 "※ sequence の各要素は `[ target_dict, emotion, hold_sec ]` の配列形式にしてください。"
             )
-
         else:
             self.system_prompt = system_prompt
 
@@ -592,12 +552,12 @@ class CatChatManager:
             conn.commit()
             cursor.close()
             conn.close()
-            print(f"💾 [Memory] '{partner_name}' との長期記憶をPi 5のDBに保存しました[cite: 1]。")
+            print(f"💾 [Memory] '{partner_name}' との長期記憶をPi 5のDBに保存しました。")
         except Exception as e:
             print(f"⚠️ [DB Error] 長期記憶の保存失敗: {e}")
 
     def summarize_and_save_session(self, partner_name: str, session):
-        print(f"🔍 [Debug-Summary] '{partner_name}' の要約処理をバックグラウンドスレッドで開始します[cite: 1]...")
+        print(f"🔍 [Debug-Summary] '{partner_name}' の要約処理をバックグラウンドスレッドで開始します...")
         try:
             history = session.history
             if not history:
@@ -612,7 +572,7 @@ class CatChatManager:
             
         except Exception as e:
             import traceback
-            print(f"❌ [Summary Error Detail] '{partner_name}' の要約処理中に例外が発生しました[cite: 1]！")
+            print(f"❌ [Summary Error Detail] '{partner_name}' の要約処理中に例外が発生しました！")
             traceback.print_exc()            
         
     def send_message(self, user_text: str, recognized_name: str = "None") -> tuple[str, list, list]:
@@ -679,7 +639,7 @@ class CatChatManager:
             name_key = "default_user"
 
         if name_key not in self.chat_sessions:
-            print(f"🧠 [Memory] '{recognized_name}' の新しい会話セッションを作成します[cite: 1]。")
+            print(f"🧠 [Memory] '{recognized_name}' の新しい会話セッションを作成します。")
             long_term_memory = self.load_long_term_memory(recognized_name)
 
             dynamic_system_prompt = self.system_prompt
@@ -694,72 +654,15 @@ class CatChatManager:
             self.chat_sessions[name_key] = session_model.start_chat(history=[])
             
         return self.chat_sessions[name_key]
-
-#     def say(self, text: str, speed: int = None):
-#         if not text.strip():
-#             return
-# 
-#         if speed is None:
-#             speed = self.voice_speed
-# 
-#         wav_file = "temp_voice.wav"
-#         raw_file = "temp_voice.raw"
-# 
-#         try:
-#             cmd_aquestalk = [AQUESTALK_PATH, "-s", str(speed), text]
-#             with open(wav_file, "wb") as f:
-#                 subprocess.run(cmd_aquestalk, stdout=f, check=True)
-#             
-#             vol_factor = max(0.0, min(1.0, (self.current_volume / 100.0)))
-# 
-#             cmd_sox = [
-#                 "sox",
-#                 "-v", str(vol_factor),
-#                 wav_file,
-#                 "-r", "8000",
-#                 "-c", "1",
-#                 "-b", "8",
-#                 "-e", "unsigned-integer",
-#                 raw_file,
-#             ]
-#             subprocess.run(cmd_sox, check=True)
-# 
-#             file_size = os.path.getsize(raw_file)
-#             estimated_play_time = file_size * 0.00012 + 0.3
-# 
-#             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-#                 sock.settimeout(10.0)
-#                 sock.connect((PICO_IP, PICO_AUDIO_PORT))
-#                 
-#                 with open(raw_file, "rb") as f:
-#                     while True:
-#                         chunk = f.read(1024)
-#                         if not chunk:
-#                             break
-#                         sock.sendall(chunk)
-#                 
-#                 sock.shutdown(socket.SHUT_WR)
-# 
-#             print(f"📡 [Audio TCP] 送信完了: '{text}' (再生予測: {estimated_play_time:.2f}秒)")
-#             time.sleep(estimated_play_time)
-# 
-#         except Exception as e:
-#             print(f"⚠️ [Audio TCP Error] 送信失敗: {e}")
-#         finally:
-#             if os.path.exists(wav_file):
-#                 os.remove(wav_file)
-#             if os.path.exists(raw_file):
-#                 os.remove(raw_file)
     
     def say(self, text: str, speed: int = None):
         if not text.strip():
             return
 
-        # ★追加：50文字を超える場合は50文字ごとに分割して順番に処理する
         if len(text) > 50:
             chunks = [text[i:i+50] for i in range(0, len(text), 50)]
             for chunk in chunks:
-                self.say(chunk, speed)   # 再帰的に分割したチャンクを送信
+                self.say(chunk, speed)
             return
 
         if speed is None:

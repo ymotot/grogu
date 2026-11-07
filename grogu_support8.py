@@ -23,29 +23,78 @@ sys.path.append("/home/pi/Downloads")
 from sface import SFace
 from yunet import YuNet
 
-# --- 追加: Adafruit ServoKit ライブラリのインポート ---
-try:
-    import board
-    import busio
-    from adafruit_servokit import ServoKit
-    HAS_SERVOKIT = True
-except ImportError:
-    HAS_SERVOKIT = False
+# --- SCSサーボ SDK のインポート ---
+from scservo_sdk import *
 
 # ==========================================
-# ネットワーク設定
+# ネットワーク & シリアル通信設定
 # ==========================================
-PI_ZERO_IP = "192.168.0.15"  # Raspberry Pi Zero 2のIPアドレス (またはメインコントローラーIP)
+PI_ZERO_IP = "192.168.0.15"  # Raspberry Pi Zero 2のIPアドレス (メインコントローラー)
 STREAM_URL = f"http://{PI_ZERO_IP}:5000/video_feed"
 ROBOT_UDP_PORT = 5005
 SERVO_TCP_PORT = 5008        # サーボ受信用TCPポート
 AUDIO_SERVER_PORT = 5001     # 音声受信用Flaskポート
 
+# FE-URT2-C001 シリアル通信設定 (Pi 5に接続)
+PORT_NAME = '/dev/ttyACM0'
+BAUDRATE = 1000000
+
+# ポートとパケットハンドラーの初期化
+port_handler = PortHandler(PORT_NAME)
+packet_handler = scscl(port_handler)
+
+if port_handler.openPort() and port_handler.setBaudRate(BAUDRATE):
+    print(f"✅ [Pi 5] SCSサーボ用シリアルポート '{PORT_NAME}' 初期化成功")
+else:
+    print(f"❌ [Pi 5] SCSサーボ用シリアルポート初期化失敗（配線やポートを確認してください）")
+
+def angle_to_position(angle: float) -> int:
+    """角度（度）をSCS0009のポジション値（0〜1023）に変換する"""
+    pos = int(500 + (angle * (1023.0 / 300.0)))
+    return max(0, min(1023, pos))
+
+
 # ==========================================
-# ★追加: 音声認識＆メインコントローラーへのテキスト送信関数
+# サーボの過負荷・ストール保護チェック関数
+# ==========================================
+def check_and_protect_servo(servo_id: int) -> bool:
+    """サーボの負荷と温度を読み出し、限界値を超えていればトルクOFFにして保護する"""
+    try:
+        # 1. 現在負荷の読み出し (レジスタ 60, 2バイト)
+        load_raw, result, error = packet_handler.read2ByteTxRx(servo_id, 60)
+        if result != COMM_SUCCESS:
+            return True  # 読み出し失敗時は処理を止めない
+            
+        load = load_raw % 1024  0〜1023の範囲に正規化
+
+        # 2. 現在温度の読み出し (レジスタ 63, 1バイト)
+        temperature, result_temp, _ = packet_handler.read1ByteTxRx(servo_id, 63)
+        temp_val = temperature if result_temp == COMM_SUCCESS else 0
+
+        # 閾値設定（必要に応じて調整してください）
+        LOAD_THRESHOLD = 750  # 過負荷・ストール判定の閾値 (max 1023)
+        TEMP_THRESHOLD = 70   # 過熱保護の閾値 (℃)
+
+        if load > LOAD_THRESHOLD:
+            print(f"🚨 [過負荷警告] サーボID {servo_id} に強い負荷 (Load: {load}) を検知！ストール防止のためトルクをOFFにします。")
+            packet_handler.write1ByteTxRx(servo_id, 40, 0)  # トルクOFF
+            return False
+
+        if temp_val > TEMP_THRESHOLD:
+            print(f"🔥 [過熱警告] サーボID {servo_id} が高温 ({temp_val}℃) です！保護のためトルクをOFFにします。")
+            packet_handler.write1ByteTxRx(servo_id, 40, 0)  # トルクOFF
+            return False
+
+    except Exception as e:
+        print(f"⚠️ [Servo Safety Check Error] ID {servo_id}: {e}")
+        
+    return True
+
+
+# ==========================================
+# 音声認識＆メインコントローラーへのテキスト送信関数
 # ==========================================
 def process_audio_and_send(wav_filepath):
-    """受信したWAVファイルを音声認識し、結果の文字列をロボットコントローラーへ送信する"""
     print(f"🎙️ [Audio Processing] 音声認識を開始します: {wav_filepath}")
     recognized_text = ""
     
@@ -57,7 +106,7 @@ def process_audio_and_send(wav_filepath):
             recognized_text = r.recognize_google(audio_data, language="ja-JP")
             print(f"✍️ [STT Success] 認識結果: {recognized_text}")
     except ImportError:
-        print("⚠️ speech_recognition がインストールされていません。ダミーテキストを使用します。")
+        print("⚠️ speech_recognition がインストールされていません。")
         recognized_text = "こんにちは"
     except Exception as e:
         print(f"⚠️ [STT Error] 音声認識失敗: {e}")
@@ -70,7 +119,6 @@ def process_audio_and_send(wav_filepath):
         os.remove(wav_filepath)
 
 def send_text_to_robot(text):
-    """音声認識結果の文字列をロボットコントローラーに送信"""
     try:
         import requests
         url = f"http://{PI_ZERO_IP}:5000/mic_message"
@@ -82,21 +130,12 @@ def send_text_to_robot(text):
 
 
 # ==========================================
-# ★追加: 音声受信用 Flask ＆ サーボサーバー
+# 音声受信用 Flask ＆ SCSサーボ制御サーバー
 # ==========================================
 def start_audio_and_servo_server():
     app = Flask(__name__)
     UPLOAD_DIR = "./received_audio"
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    kit = None
-    if HAS_SERVOKIT:
-        try:
-            i2c_bus = busio.I2C(board.SCL, board.SDA, frequency=100000)
-            kit = ServoKit(channels=16, i2c=i2c_bus)
-            print("✅ [Pi 5] PCA9685 ServoKit 初期化成功")
-        except Exception as e:
-            print(f"⚠ [Pi 5] PCA9685 初期化エラー: {e}")
 
     @app.route('/voice_upload', methods=['POST'])
     def voice_upload():
@@ -128,19 +167,40 @@ def start_audio_and_servo_server():
         try:
             server_socket.bind(("0.0.0.0", SERVO_TCP_PORT))
             server_socket.listen(5)
-            print(f"🚀 [Pi 5] サーボ制御TCPサーバー待機中 (Port: {SERVO_TCP_PORT})...")
+            print(f"🚀 [Pi 5] SCSサーボ制御TCPサーバー待機中 (Port: {SERVO_TCP_PORT})...")
             while True:
                 conn, _ = server_socket.accept()
                 data = conn.recv(1024).decode("utf-8").strip()
-                if data and kit:
+                if data:
                     parts = data.split(",")
                     if len(parts) == 2:
-                        pin = int(parts[0])
+                        servo_id = int(parts[0])  # サーボID (1や9)[cite: 5]
                         angle_str = parts[1]
-                        if angle_str == "None":
-                            kit.servo[pin].angle = None
-                        else:
-                            kit.servo[pin].angle = float(angle_str)
+                        
+                        try:
+                            if angle_str == "None":
+                                # トルクOFF（脱力）: レジスタ40に 0 を書き込む[cite: 5]
+                                packet_handler.write1ByteTxRx(servo_id, 40, 0)
+                            else:
+                                angle = float(angle_str)
+                                
+                                # 動き出す前に過負荷・ストール状態でないか安全確認
+                                if not check_and_protect_servo(servo_id):
+                                    conn.close()
+                                    continue
+
+                                # 1. トルクON (レジスタ40 = 1)[cite: 5]
+                                packet_handler.write1ByteTxRx(servo_id, 40, 1)
+                                # 2. 位置移動 (レジスタ42にポジション値を書き込む)[cite: 5]
+                                position = angle_to_position(angle)
+                                packet_handler.write2ByteTxRx(servo_id, 42, position)
+                                
+                                # 移動直後にも軽く負荷をチェックして保護
+                                time.sleep(0.01)
+                                check_and_protect_servo(servo_id)
+
+                        except Exception as e:
+                            print(f"⚠️ [Servo Control Error] ID {servo_id}: {e}")
                 conn.close()
         except Exception as e:
             print(f"⚠️ [Servo TCP Error] {e}")
@@ -250,7 +310,7 @@ class FaceAndObjectServer:
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
-        # --- 👁️ MediaPipe Face Mesh（居眠り・状態比較用）の初期化 ---
+        # --- 👁️ MediaPipe Face Mesh（居眠り検出用） ---
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
@@ -261,16 +321,14 @@ class FaceAndObjectServer:
         self.LEFT_EYE = [33, 160, 158, 133, 153, 144]
         self.RIGHT_EYE = [362, 385, 387, 263, 373, 380]
         
-        # 居眠り判定パラメータ（相対比較用）
-        self.FALLBACK_EAR_THRESHOLD = 0.18 # ベースラインが取れるまでの保険用固定閾値
-        self.EAR_DROP_RATIO = 0.70         # 通常時の平均から何割に下がったら閉じているとみなすか (0.70 = 30%減)
-        self.CONSEC_FRAMES = 500           # 何フレーム連続したら警告するか
-        self.drowsy_counter = 0            # 連続フレームカウンタ
-        self.is_drowsy = False             # 居眠り状態フラグ
+        self.FALLBACK_EAR_THRESHOLD = 0.18
+        self.EAR_DROP_RATIO = 0.70
+        self.CONSEC_FRAMES = 500
+        self.drowsy_counter = 0
+        self.is_drowsy = False
         
-        # ベースライン（通常の目の開き）学習用バッファ
         self.ear_history = []
-        self.MAX_HISTORY_LEN = 150         # 直近150フレーム（数秒〜十数秒）の履歴を保持
+        self.MAX_HISTORY_LEN = 150
 
     def _preload_target_faces(self):
         for name, path in self.face_images.items():
@@ -307,7 +365,6 @@ class FaceAndObjectServer:
         self.w = img2.shape[1]
         image_height, image_width, _ = img2.shape
         
-        # 1. 既存の顔検出 (YuNet) & 認証 (SFace)
         faces2 = self.detect_faces(img2)
         raw_status = "None"
         face_center_x = None
@@ -332,7 +389,6 @@ class FaceAndObjectServer:
         else:
             updated_angle = round(self.head_angle, 1)
 
-        # 2. 安定化処理 (既存)
         if raw_status == self.stable_status:
             self.pending_status = raw_status
             self.pending_count = 0
@@ -347,7 +403,6 @@ class FaceAndObjectServer:
                 self.stable_status = self.pending_status
                 self.pending_count = 0
 
-        # --- 👁️ 3. 状態比較＆動的ベースラインによる居眠り (EAR) 検出 ---
         rgb_frame = cv_recog.cvtColor(img2, cv_recog.COLOR_BGR2RGB)
         mesh_results = self.face_mesh.process(rgb_frame)
         
@@ -363,13 +418,11 @@ class FaceAndObjectServer:
                 right_ear = self.calculate_ear(self.RIGHT_EYE, landmarks, image_width, image_height)
                 current_ear = (left_ear + right_ear) / 2.0
                 
-                # ★ベースライン学習: 極端に閉じていない状態（例: EAR > 0.19以上）のときを「起きている通常の開き具合」として学習・蓄積する
                 if current_ear > 0.19:
                     self.ear_history.append(current_ear)
                     if len(self.ear_history) > self.MAX_HISTORY_LEN:
                         self.ear_history.pop(0)
                 
-                # 履歴が十分に溜まったらベースライン（平均値）と動的閾値を算出
                 if len(self.ear_history) >= 20:
                     baseline_ear = float(np.mean(self.ear_history))
                     dynamic_threshold = baseline_ear * self.EAR_DROP_RATIO
@@ -377,7 +430,6 @@ class FaceAndObjectServer:
                     baseline_ear = current_ear
                     dynamic_threshold = self.FALLBACK_EAR_THRESHOLD
                 
-                # 判定ロジック（通常の開き具合から大幅に落ち込んでいるか）
                 if current_ear < dynamic_threshold:
                     self.drowsy_counter += 1
                     if self.drowsy_counter >= self.CONSEC_FRAMES:
@@ -392,7 +444,6 @@ class FaceAndObjectServer:
         return self.stable_status, face_center_x, updated_angle, self.is_drowsy, current_ear, baseline_ear
 
     def draw_status_overlay(self, frame, status, face_center_x, head_angle, is_drowsy, ear_val, baseline_val):
-        # 情報を表示するため枠を少し大きめに確保
         cv_recog.rectangle(frame, (10, 10), (360, 140), (0, 0, 0), -1)
         
         text = f"STATUS: {status}" if status != "None" else "STATUS: No Face"
@@ -401,7 +452,6 @@ class FaceAndObjectServer:
         cv_recog.putText(frame, f"NECK ANGLE: {head_angle} deg", (20, 60), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv_recog.LINE_AA)
         cv_recog.putText(frame, f"EAR: {ear_val:.2f} (Base: {baseline_val:.2f})", (20, 85), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv_recog.LINE_AA)
         
-        # 居眠りアラートの表示
         if is_drowsy:
             cv_recog.putText(frame, "DROWSY ALERT!", (20, 115), cv_recog.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv_recog.LINE_AA)
         else:
@@ -430,7 +480,6 @@ class FaceAndObjectServer:
                     "ear": round(ear_val, 2),
                     "baseline": round(baseline_val, 2)
                 }
-                print(f"📤 [UDP送信] 名前: {status}, 角度: {current_angle}, 居眠り: {is_drowsy} (EAR: {ear_val:.2f}/Base: {baseline_val:.2f})")
                 self.sock.sendto(json.dumps(payload).encode("utf-8"), (PI_ZERO_IP, ROBOT_UDP_PORT))
                 last_send_time = now
 
@@ -443,6 +492,9 @@ class FaceAndObjectServer:
         cap.release()
         cv_recog.destroyAllWindows()
         self.sock.close()
+        
+        if port_handler:
+            port_handler.closePort()
 
     def calculate_ear(self, eye_landmarks, landmarks, image_width, image_height):
         pts = []
