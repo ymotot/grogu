@@ -157,9 +157,17 @@ HTML_TEMPLATE = """
                     <div class="status-item">感情<span id="current-emotion">Normal</span></div>
                     <div class="status-item">首角度<span id="neck-angle">0.0°</span></div>
                 </div>
-                <pre id="servo-angles">1: 0.0, 9: -90.0</pre>
+                
+                <!-- ▼ 複数サーボ詳細ステータス表示エリア ▼ -->
+                <h2 style="margin-top: 8px;">⚙️ Servo Status</h2>
+                <div id="servo-status-container" style="display: flex; flex-direction: column; gap: 4px; font-size: 0.78em;">
+                    <!-- JavaScriptで動的にサーボごとのカードを生成・更新します -->
+                    <div style="background: #2a2a2a; padding: 4px 6px; border-radius: 4px; text-align: center; color: #aaa;">データ待機中...</div>
+                </div>
+                <!-- ▲ここまで▲ -->
+                
+                <pre id="servo-angles" style="display:none;">1: 0.0, 9: -90.0</pre>
             </div>
-            
             <div class="card">
                 <h2>🔄 腰制御 & 🔊 音量</h2>
                 <div style="display: flex; gap: 4px; align-items: center; margin-bottom: 4px;">
@@ -196,7 +204,27 @@ HTML_TEMPLATE = """
             document.getElementById('rec-name').innerText = data.recognized_name;
             document.getElementById('current-emotion').innerText = data.emotion;
             document.getElementById('neck-angle').innerText = (data.neck_angle !== null ? data.neck_angle.toFixed(1) : '0.0') + '°';
-            document.getElementById('servo-angles').innerText = JSON.stringify(data.joint_angles);
+            
+            // 複数サーボ情報の動的描画
+            const container = document.getElementById('servo-status-container');
+            if (data.servo_statuses && Object.keys(data.servo_statuses).length > 0) {
+                let html = '';
+                for (const [servoId, stat] of Object.entries(data.servo_statuses)) {
+                    let movingText = (stat.is_moving === 1) ? '🔄 駆動中' : '⏹️ 停止';
+                    let loadColor = stat.load > 750 ? '#FF5252' : '#FFB74D'; // 負荷が高いと赤っぽく警告
+                    
+                    html += `
+                        <div style="background: #222; border: 1px solid #333; border-radius: 4px; padding: 4px 8px; display: flex; justify-content: space-between; align-items: center;">
+                            <div><b>ID ${servoId}</b></div>
+                            <div>負荷: <span style="color: ${loadColor};">${stat.load}</span></div>
+                            <div>電圧: <span style="color: #4DD0E1;">${stat.voltage.toFixed(1)}V</span></div>
+                            <div>温度: <span style="color: #E57373;">${stat.temperature}°C</span></div>
+                            <div>${movingText}</div>
+                        </div>
+                    `;
+                }
+                container.innerHTML = html;
+            }
         });
         socket.on('chat_response', function(data) {
             const log = document.getElementById('chat-log');
@@ -268,7 +296,10 @@ class PiCameraClient:
         self.app = Flask(__name__)
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode="threading")
         self.setup_routes()
-
+        
+        # ★ 複数サーボステータス保持用変数
+        self.latest_servo_statuses = {}
+        
     def camera_worker(self):
         try:
             cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
@@ -403,11 +434,19 @@ class PiCameraClient:
                         self.latest_is_drowsy = bool(is_drowsy)
                         self.latest_ear = float(payload.get("ear", 0.0))
                         self.latest_baseline = float(payload.get("baseline", 0.0))
+                        
+                        self.latest_is_drowsy = bool(is_drowsy)
+                        self.latest_ear = float(payload.get("ear", 0.0))
+                        self.latest_baseline = float(payload.get("baseline", 0.0))
+                        
+                        # 複数サーボ情報の受け取り
+                        if "servo_statuses" in payload:
+                            self.latest_servo_statuses = payload["servo_statuses"]
 
                         if is_drowsy and self.robot_controller:
                             if hasattr(self.robot_controller, "handle_drowsy_alert"):
                                 self.robot_controller.handle_drowsy_alert(recognized_name)
-
+                                
                 except json.JSONDecodeError:
                     if message.replace('.', '', 1).replace('-', '', 1).isdigit():
                         self.latest_neck_angle = float(message)
@@ -430,6 +469,7 @@ class PiCameraClient:
                     "neck_angle": self.latest_neck_angle if self.latest_neck_angle is not None else 0.0,
                     "emotion": self.robot_controller.current_emotion,
                     "joint_angles": self.robot_controller.current_poses,
+                    "servo_statuses": self.latest_servo_statuses, # 送信データに追加
                 }
                 self.socketio.emit("status_update", status_data)
             time.sleep(0.2)

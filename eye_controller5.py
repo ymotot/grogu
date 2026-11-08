@@ -4,6 +4,13 @@ import random
 import threading
 from PIL import Image, ImageDraw
 import RPi.GPIO as GPIO
+# --- ここを追加：ピンのモードをBCMに設定する ---
+GPIO.setmode(GPIO.BCM)
+# ----------------------------------------
+
+# その後に既存のsetup処理が来るようにする
+GPIO.setup(self.cs_left, GPIO.OUT)
+
 import spidev
 import numpy as np
 

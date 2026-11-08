@@ -65,7 +65,7 @@ def check_and_protect_servo(servo_id: int) -> bool:
         if result != COMM_SUCCESS:
             return True  # 読み出し失敗時は処理を止めない
             
-        load = load_raw % 1024  0〜1023の範囲に正規化
+        load = load_raw % 1024  #0〜1023の範囲に正規化
 
         # 2. 現在温度の読み出し (レジスタ 63, 1バイト)
         temperature, result_temp, _ = packet_handler.read1ByteTxRx(servo_id, 63)
@@ -456,6 +456,37 @@ class FaceAndObjectServer:
             cv_recog.putText(frame, "DROWSY ALERT!", (20, 115), cv_recog.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv_recog.LINE_AA)
         else:
             cv_recog.putText(frame, "Awake (Relative)", (20, 115), cv_recog.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv_recog.LINE_AA)
+            
+    # 【変更】複数サーボのステータスをまとめて読み出す関数
+    def read_all_servo_statuses(self, servo_ids=[1, 9]):
+        servo_statuses = {}
+        for servo_id in servo_ids:
+            try:
+                # ① 現在負荷 (Address 60, 2 Byte)
+                load_raw, r1, _ = packet_handler.read2ByteTxRx(servo_id, 60)
+                load = (load_raw % 1024) if r1 == COMM_SUCCESS else 0
+
+                # ② 現在電圧 (Address 62, 1 Byte - 0.1V単位)
+                vol_raw, r2, _ = packet_handler.read1ByteTxRx(servo_id, 62)
+                voltage = (vol_raw * 0.1) if r2 == COMM_SUCCESS else 0.0
+
+                # ③ 現在温度 (Address 63, 1 Byte)
+                temp_raw, r3, _ = packet_handler.read1ByteTxRx(servo_id, 63)
+                temperature = temp_raw if r3 == COMM_SUCCESS else 0
+
+                # ④ 動作状態 (Address 66, 1 Byte - 1:駆動中, 0:停止)
+                mov_raw, r4, _ = packet_handler.read1ByteTxRx(servo_id, 66)
+                is_moving = mov_raw if r4 == COMM_SUCCESS else 0
+
+                servo_statuses[str(servo_id)] = {
+                    "load": load,
+                    "voltage": round(voltage, 1),
+                    "temperature": temperature,
+                    "is_moving": is_moving
+                }
+            except Exception:
+                servo_statuses[str(servo_id)] = {"load": 0, "voltage": 0.0, "temperature": 0, "is_moving": 0}
+        return servo_statuses
 
     def run(self):
         cap = FreshFrameReader(STREAM_URL)
@@ -469,8 +500,25 @@ class FaceAndObjectServer:
                 time.sleep(0.01)
                 continue
 
+#             status, face_center_x, current_angle, is_drowsy, ear_val, baseline_val = self.recognition_process(frame)
+#             
+#             now = time.time()
+#             if now - last_send_time >= send_interval:
+#                 payload = {
+#                     "name": status, 
+#                     "neck_angle": current_angle,
+#                     "is_drowsy": is_drowsy,
+#                     "ear": round(ear_val, 2),
+#                     "baseline": round(baseline_val, 2)
+#                 }
+#                 self.sock.sendto(json.dumps(payload).encode("utf-8"), (PI_ZERO_IP, ROBOT_UDP_PORT))
+#                 last_send_time = now
+            
             status, face_center_x, current_angle, is_drowsy, ear_val, baseline_val = self.recognition_process(frame)
             
+            # 複数サーボのステータスを取得 (ID 1 と ID 9)
+            all_servo_status = self.read_all_servo_statuses([1, 9])
+
             now = time.time()
             if now - last_send_time >= send_interval:
                 payload = {
@@ -478,11 +526,12 @@ class FaceAndObjectServer:
                     "neck_angle": current_angle,
                     "is_drowsy": is_drowsy,
                     "ear": round(ear_val, 2),
-                    "baseline": round(baseline_val, 2)
+                    "baseline": round(baseline_val, 2),
+                    "servo_statuses": all_servo_status  # まとめて送信
                 }
                 self.sock.sendto(json.dumps(payload).encode("utf-8"), (PI_ZERO_IP, ROBOT_UDP_PORT))
                 last_send_time = now
-
+    
             self.draw_status_overlay(frame, status, face_center_x, current_angle, is_drowsy, ear_val, baseline_val)
             cv_recog.imshow("Grogu Recognition Server", frame)
             if cv_recog.waitKey(1) & 0xFF == ord("q"):
