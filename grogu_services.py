@@ -161,7 +161,6 @@ HTML_TEMPLATE = """
                 <!-- ▼ 複数サーボ詳細ステータス表示エリア ▼ -->
                 <h2 style="margin-top: 8px;">⚙️ Servo Status</h2>
                 <div id="servo-status-container" style="display: flex; flex-direction: column; gap: 4px; font-size: 0.78em;">
-                    <!-- JavaScriptで動的にサーボごとのカードを生成・更新します -->
                     <div style="background: #2a2a2a; padding: 4px 6px; border-radius: 4px; text-align: center; color: #aaa;">データ待機中...</div>
                 </div>
                 <!-- ▲ここまで▲ -->
@@ -205,13 +204,12 @@ HTML_TEMPLATE = """
             document.getElementById('current-emotion').innerText = data.emotion;
             document.getElementById('neck-angle').innerText = (data.neck_angle !== null ? data.neck_angle.toFixed(1) : '0.0') + '°';
             
-            // 複数サーボ情報の動的描画
             const container = document.getElementById('servo-status-container');
             if (data.servo_statuses && Object.keys(data.servo_statuses).length > 0) {
                 let html = '';
                 for (const [servoId, stat] of Object.entries(data.servo_statuses)) {
                     let movingText = (stat.is_moving === 1) ? '🔄 駆動中' : '⏹️ 停止';
-                    let loadColor = stat.load > 750 ? '#FF5252' : '#FFB74D'; // 負荷が高いと赤っぽく警告
+                    let loadColor = stat.load > 750 ? '#FF5252' : '#FFB74D';
                     
                     html += `
                         <div style="background: #222; border: 1px solid #333; border-radius: 4px; padding: 4px 8px; display: flex; justify-content: space-between; align-items: center;">
@@ -288,16 +286,14 @@ class PiCameraClient:
         self.latest_recognized_name = "None"
         self.latest_neck_angle = None
         
-        # ★ 居眠り検知データの安全保持用変数
-        self.latest_is_drowsy = False
-        self.latest_ear = 0.0
-        self.latest_baseline = 0.0
+        # ポーズトリガー保持用変数
+        self.latest_pose_trigger = None
 
         self.app = Flask(__name__)
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode="threading")
         self.setup_routes()
         
-        # ★ 複数サーボステータス保持用変数
+        # 複数サーボステータス保持用変数
         self.latest_servo_statuses = {}
         
     def camera_worker(self):
@@ -428,24 +424,23 @@ class PiCameraClient:
                         if angle is not None:
                             self.latest_neck_angle = float(angle)
                             
-                        is_drowsy = payload.get("is_drowsy", False)
-                        recognized_name = payload.get("name", "None")
-                        
-                        self.latest_is_drowsy = bool(is_drowsy)
-                        self.latest_ear = float(payload.get("ear", 0.0))
-                        self.latest_baseline = float(payload.get("baseline", 0.0))
-                        
-                        self.latest_is_drowsy = bool(is_drowsy)
-                        self.latest_ear = float(payload.get("ear", 0.0))
-                        self.latest_baseline = float(payload.get("baseline", 0.0))
-                        
+                        # ポーズトリガーの受け取り
+                        pose_trigger = payload.get("pose_trigger")
+                        if pose_trigger:
+                            self.latest_pose_trigger = str(pose_trigger)
+                            recognized_name = payload.get("name", "None")
+                            print(f"🔥 [UDP受信] ポーズトリガー検知: {self.latest_pose_trigger} (人物: {recognized_name})")
+                            
+                            if self.robot_controller and hasattr(self.robot_controller, "handle_pose_trigger"):
+                                threading.Thread(
+                                    target=self.robot_controller.handle_pose_trigger,
+                                    args=(self.latest_pose_trigger, recognized_name),
+                                    daemon=True
+                                ).start()
+
                         # 複数サーボ情報の受け取り
                         if "servo_statuses" in payload:
                             self.latest_servo_statuses = payload["servo_statuses"]
-
-                        if is_drowsy and self.robot_controller:
-                            if hasattr(self.robot_controller, "handle_drowsy_alert"):
-                                self.robot_controller.handle_drowsy_alert(recognized_name)
                                 
                 except json.JSONDecodeError:
                     if message.replace('.', '', 1).replace('-', '', 1).isdigit():
@@ -469,7 +464,7 @@ class PiCameraClient:
                     "neck_angle": self.latest_neck_angle if self.latest_neck_angle is not None else 0.0,
                     "emotion": self.robot_controller.current_emotion,
                     "joint_angles": self.robot_controller.current_poses,
-                    "servo_statuses": self.latest_servo_statuses, # 送信データに追加
+                    "servo_statuses": self.latest_servo_statuses,
                 }
                 self.socketio.emit("status_update", status_data)
             time.sleep(0.2)

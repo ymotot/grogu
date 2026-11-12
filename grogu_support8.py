@@ -39,65 +39,42 @@ AUDIO_SERVER_PORT = 5001     # 音声受信用Flaskポート
 PORT_NAME = '/dev/ttyACM0'
 BAUDRATE = 1000000
 
-# ポートとパケットハンドラーの初期化
 port_handler = PortHandler(PORT_NAME)
 packet_handler = scscl(port_handler)
 
 if port_handler.openPort() and port_handler.setBaudRate(BAUDRATE):
     print(f"✅ [Pi 5] SCSサーボ用シリアルポート '{PORT_NAME}' 初期化成功")
 else:
-    print(f"❌ [Pi 5] SCSサーボ用シリアルポート初期化失敗（配線やポートを確認してください）")
+    print(f"❌ [Pi 5] SCSサーボ用シリアルポート初期化失敗")
 
 def angle_to_position(angle: float) -> int:
-    """角度（度）をSCS0009のポジション値（0〜1023）に変換する"""
     pos = int(500 + (angle * (1023.0 / 300.0)))
     return max(0, min(1023, pos))
 
-
-# ==========================================
-# サーボの過負荷・ストール保護チェック関数
-# ==========================================
 def check_and_protect_servo(servo_id: int) -> bool:
-    """サーボの負荷と温度を読み出し、限界値を超えていればトルクOFFにして保護する"""
     try:
-        # 1. 現在負荷の読み出し (レジスタ 60, 2バイト)
-        load_raw, result, error = packet_handler.read2ByteTxRx(servo_id, 60)
+        load_raw, result, _ = packet_handler.read2ByteTxRx(servo_id, 60)
         if result != COMM_SUCCESS:
-            return True  # 読み出し失敗時は処理を止めない
-            
-        load = load_raw % 1024  #0〜1023の範囲に正規化
-
-        # 2. 現在温度の読み出し (レジスタ 63, 1バイト)
+            return True
+        load = load_raw % 1024
         temperature, result_temp, _ = packet_handler.read1ByteTxRx(servo_id, 63)
         temp_val = temperature if result_temp == COMM_SUCCESS else 0
 
-        # 閾値設定（必要に応じて調整してください）
-        LOAD_THRESHOLD = 750  # 過負荷・ストール判定の閾値 (max 1023)
-        TEMP_THRESHOLD = 70   # 過熱保護の閾値 (℃)
-
-        if load > LOAD_THRESHOLD:
-            print(f"🚨 [過負荷警告] サーボID {servo_id} に強い負荷 (Load: {load}) を検知！ストール防止のためトルクをOFFにします。")
-            packet_handler.write1ByteTxRx(servo_id, 40, 0)  # トルクOFF
+        if load > 750:
+            print(f"🚨 [過負荷警告] サーボID {servo_id} (Load: {load}) トルクOFF")
+            packet_handler.write1ByteTxRx(servo_id, 40, 0)
             return False
-
-        if temp_val > TEMP_THRESHOLD:
-            print(f"🔥 [過熱警告] サーボID {servo_id} が高温 ({temp_val}℃) です！保護のためトルクをOFFにします。")
-            packet_handler.write1ByteTxRx(servo_id, 40, 0)  # トルクOFF
+        if temp_val > 70:
+            print(f"🔥 [過熱警告] サーボID {servo_id} ({temp_val}℃) トルクOFF")
+            packet_handler.write1ByteTxRx(servo_id, 40, 0)
             return False
-
     except Exception as e:
         print(f"⚠️ [Servo Safety Check Error] ID {servo_id}: {e}")
-        
     return True
 
-
-# ==========================================
-# 音声認識＆メインコントローラーへのテキスト送信関数
-# ==========================================
 def process_audio_and_send(wav_filepath):
-    print(f"🎙️ [Audio Processing] 音声認識を開始します: {wav_filepath}")
+    print(f"🎙️ [Audio Processing] 音声認識開始: {wav_filepath}")
     recognized_text = ""
-    
     try:
         import speech_recognition as sr
         r = sr.Recognizer()
@@ -105,12 +82,8 @@ def process_audio_and_send(wav_filepath):
             audio_data = r.record(source)
             recognized_text = r.recognize_google(audio_data, language="ja-JP")
             print(f"✍️ [STT Success] 認識結果: {recognized_text}")
-    except ImportError:
-        print("⚠️ speech_recognition がインストールされていません。")
-        recognized_text = "こんにちは"
     except Exception as e:
         print(f"⚠️ [STT Error] 音声認識失敗: {e}")
-        recognized_text = ""
 
     if recognized_text:
         send_text_to_robot(recognized_text)
@@ -124,14 +97,9 @@ def send_text_to_robot(text):
         url = f"http://{PI_ZERO_IP}:5000/mic_message"
         payload = {"message": text}
         requests.post(url, json=payload, timeout=3.0)
-        print(f"📤 [Sent to Robot] テキストを送信しました: {text}")
     except Exception as e:
         print(f"⚠️ [Send Error] ロボットへのテキスト送信失敗: {e}")
 
-
-# ==========================================
-# 音声受信用 Flask ＆ SCSサーボ制御サーバー
-# ==========================================
 def start_audio_and_servo_server():
     app = Flask(__name__)
     UPLOAD_DIR = "./received_audio"
@@ -143,22 +111,16 @@ def start_audio_and_servo_server():
             audio_data = request.data
             if not audio_data:
                 return jsonify({"status": "error", "message": "Empty audio"}), 400
-
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             wav_filepath = os.path.join(UPLOAD_DIR, f"audio_{timestamp}.wav")
-
             with wave.open(wav_filepath, 'wb') as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(16000)
                 wf.writeframes(audio_data)
-
-            print(f"📁 [Voice Received] 音声を保存しました: {wav_filepath}")
             threading.Thread(target=process_audio_and_send, args=(wav_filepath,), daemon=True).start()
-
             return jsonify({"status": "success", "saved": wav_filepath}), 200
         except Exception as e:
-            print(f"❌ [Voice Upload Error] {e}")
             return jsonify({"status": "error", "message": str(e)}), 500
 
     def run_servo_tcp():
@@ -167,38 +129,24 @@ def start_audio_and_servo_server():
         try:
             server_socket.bind(("0.0.0.0", SERVO_TCP_PORT))
             server_socket.listen(5)
-            print(f"🚀 [Pi 5] SCSサーボ制御TCPサーバー待機中 (Port: {SERVO_TCP_PORT})...")
             while True:
                 conn, _ = server_socket.accept()
                 data = conn.recv(1024).decode("utf-8").strip()
                 if data:
                     parts = data.split(",")
                     if len(parts) == 2:
-                        servo_id = int(parts[0])  # サーボID (1や9)[cite: 5]
-                        angle_str = parts[1]
-                        
+                        servo_id, angle_str = int(parts[0]), parts[1]
                         try:
                             if angle_str == "None":
-                                # トルクOFF（脱力）: レジスタ40に 0 を書き込む[cite: 5]
                                 packet_handler.write1ByteTxRx(servo_id, 40, 0)
                             else:
                                 angle = float(angle_str)
-                                
-                                # 動き出す前に過負荷・ストール状態でないか安全確認
                                 if not check_and_protect_servo(servo_id):
                                     conn.close()
                                     continue
-
-                                # 1. トルクON (レジスタ40 = 1)[cite: 5]
                                 packet_handler.write1ByteTxRx(servo_id, 40, 1)
-                                # 2. 位置移動 (レジスタ42にポジション値を書き込む)[cite: 5]
                                 position = angle_to_position(angle)
                                 packet_handler.write2ByteTxRx(servo_id, 42, position)
-                                
-                                # 移動直後にも軽く負荷をチェックして保護
-                                time.sleep(0.01)
-                                check_and_protect_servo(servo_id)
-
                         except Exception as e:
                             print(f"⚠️ [Servo Control Error] ID {servo_id}: {e}")
                 conn.close()
@@ -206,17 +154,30 @@ def start_audio_and_servo_server():
             print(f"⚠️ [Servo TCP Error] {e}")
 
     threading.Thread(target=run_servo_tcp, daemon=True).start()
-
     import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
-    print(f"🌐 音声受信用APIサーバーを起動します (Port: {AUDIO_SERVER_PORT})...")
     app.run(host="0.0.0.0", port=AUDIO_SERVER_PORT, debug=False, use_reloader=False)
 
+# grogu_support8.py の上部や適当な位置に DHT11Reader クラスを追加
 
-# ==========================================
-# 最新フレームのみを保持するキャプチャクラス
-# ==========================================
+class DHT11Reader:
+    def __init__(self, device_path="/sys/bus/iio/devices/iio:device0", max_retries=3):
+        self.device_path = device_path
+        self.max_retries = max_retries
+
+    def read(self):
+        for _ in range(self.max_retries):
+            try:
+                with open(f"{self.device_path}/in_temp_input", "r") as f:
+                    temp = int(f.read().strip()) / 1000.0
+                with open(f"{self.device_path}/in_humidityrelative_input", "r") as f:
+                    humidity = int(f.read().strip()) / 1000.0
+                return temp, humidity
+            except (OSError, ValueError):
+                time.sleep(0.5)
+        return None, None
+
 class FreshFrameReader:
     def __init__(self, src):
         self.cap = cv_recog.VideoCapture(src)
@@ -224,7 +185,6 @@ class FreshFrameReader:
         self.frame = None
         self.running = True
         self.lock = threading.Lock()
-
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
 
@@ -252,7 +212,6 @@ class FreshFrameReader:
         self.thread.join(timeout=1.0)
         self.cap.release()
 
-
 class FaceAndObjectServer:
     def __init__(
         self,
@@ -270,30 +229,14 @@ class FaceAndObjectServer:
             [cv_recog.dnn.DNN_BACKEND_TIMVX, cv_recog.dnn.DNN_TARGET_NPU],
             [cv_recog.dnn.DNN_BACKEND_CANN, cv_recog.dnn.DNN_TARGET_NPU],
         ]
-
         self.backend_id = self.backend_target_pairs[backend_target_id][0]
         self.target_id = self.backend_target_pairs[backend_target_id][1]
         self.dis_type = dis_type
-
         self.w = input_size[0]
         self.head_angle = 0.0
 
-        self.recognizer = SFace(
-            modelPath=self.model_path,
-            disType=self.dis_type,
-            backendId=self.backend_id,
-            targetId=self.target_id,
-        )
-
-        self.detector = YuNet(
-            modelPath="/home/pi/Downloads/face_detection_yunet_2023mar.onnx",
-            inputSize=input_size,
-            confThreshold=conf_threshold,
-            nmsThreshold=0.3,
-            topK=5000,
-            backendId=self.backend_id,
-            targetId=self.target_id,
-        )
+        self.recognizer = SFace(modelPath=self.model_path, disType=self.dis_type, backendId=self.backend_id, targetId=self.target_id)
+        self.detector = YuNet(modelPath="/home/pi/Downloads/face_detection_yunet_2023mar.onnx", inputSize=input_size, confThreshold=conf_threshold, nmsThreshold=0.3, topK=5000, backendId=self.backend_id, targetId=self.target_id)
 
         self.face_images = {
             "Tsutomu": "/home/pi/Downloads/target/tsutomu.png",
@@ -310,33 +253,33 @@ class FaceAndObjectServer:
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
-        # --- 👁️ MediaPipe Face Mesh（居眠り検出用） ---
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        self.LEFT_EYE = [33, 160, 158, 133, 153, 144]
-        self.RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-        
-        self.FALLBACK_EAR_THRESHOLD = 0.18
-        self.EAR_DROP_RATIO = 0.70
-        self.CONSEC_FRAMES = 500
-        self.drowsy_counter = 0
-        self.is_drowsy = False
-        
-        self.ear_history = []
-        self.MAX_HISTORY_LEN = 150
+        # --- MediaPipe Pose 関連（全身ポーズ検知） ---
+        self.mp_pose = mp.solutions.pose
+        self.pose_detector = self.mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+        self.mp_drawing = mp.solutions.drawing_utils
+
+        # ポーズ検知・カウンタ関連
+        self.counter_hand_raise = 0
+        self.counter_arm_fold = 0
+        self.counter_sitting = 0
+        self.counter_lying = 0
+        self.POSE_THRESHOLD = 15
+
+        self.in_state_hand_raise = False
+        self.in_state_arm_fold = False
+        self.in_state_sitting = False
+        self.in_state_lying = False
+        self.latest_detected_trigger = None
+
+        # フレームスキップ用カウンタ（負荷軽減用：3フレームに1回処理）
+        self.pose_frame_counter = 0
+        self.POSE_SKIP_FRAMES = 3
 
     def _preload_target_faces(self):
         for name, path in self.face_images.items():
-            if not os.path.exists(path):
-                continue
+            if not os.path.exists(path): continue
             img = cv_recog.imread(path)
-            if img is None:
-                continue
+            if img is None: continue
             self.detector.setInputSize([img.shape[1], img.shape[0]])
             faces = self.detector.infer(img)
             if faces is not None and faces.shape[0] > 0:
@@ -346,9 +289,7 @@ class FaceAndObjectServer:
         center_x = self.w / 2.0
         offset = face_center_x - center_x
         DEADZONE = 15.0
-        if abs(offset) < DEADZONE:
-            return round(self.head_angle, 1)
-
+        if abs(offset) < DEADZONE: return round(self.head_angle, 1)
         max_target_angle = 45.0
         target_angle = - (offset / center_x) * max_target_angle
         alpha = 0.3
@@ -358,12 +299,12 @@ class FaceAndObjectServer:
 
     def detect_faces(self, img):
         self.detector.setInputSize([img.shape[1], img.shape[0]])
-        faces = self.detector.infer(img)
-        return faces
+        return self.detector.infer(img)
 
     def recognition_process(self, img2):
+        # 左右反転（ミラー化）
+        img2 = cv_recog.flip(img2, 1)
         self.w = img2.shape[1]
-        image_height, image_width, _ = img2.shape
         
         faces2 = self.detect_faces(img2)
         raw_status = "None"
@@ -372,117 +313,184 @@ class FaceAndObjectServer:
 
         if faces2 is not None and faces2.shape[0] > 0:
             first_face = faces2[0]
-            x_min, y_min, box_w, box_h = int(first_face[0]), int(first_face[1]), int(first_face[2]), int(first_face[3])
+            x_min, box_w = int(first_face[0]), int(first_face[2])
             face_center_x = x_min + (box_w / 2.0)
             updated_angle = self.update_angles(face_center_x)
 
             best_score = -1.0
             best_name = "Unknown"
             for name, (img1, face1) in self.target_faces_cache.items():
-                match_res = self.recognizer.match(img1, face1[:-1], img2, first_face[:-1])
-                score = match_res[0]
+                score = self.recognizer.match(img1, face1[:-1], img2, first_face[:-1])[0]
                 if score > best_score:
                     best_score = score
-                    if score >= self.MATCH_THRESHOLD:
-                        best_name = name
+                    if score >= self.MATCH_THRESHOLD: best_name = name
             raw_status = best_name
-        else:
-            updated_angle = round(self.head_angle, 1)
 
         if raw_status == self.stable_status:
             self.pending_status = raw_status
             self.pending_count = 0
         else:
-            if raw_status == self.pending_status:
-                self.pending_count += 1
+            if raw_status == self.pending_status: self.pending_count += 1
             else:
                 self.pending_status = raw_status
                 self.pending_count = 1
-
             if self.pending_count >= self.REQUIRED_STABLE_FRAMES:
                 self.stable_status = self.pending_status
                 self.pending_count = 0
 
         rgb_frame = cv_recog.cvtColor(img2, cv_recog.COLOR_BGR2RGB)
-        mesh_results = self.face_mesh.process(rgb_frame)
         
-        current_ear = 0.0
-        baseline_ear = 0.0
-        dynamic_threshold = self.FALLBACK_EAR_THRESHOLD
-        self.is_drowsy = False
-
-        if mesh_results.multi_face_landmarks:
-            for face_landmarks in mesh_results.multi_face_landmarks:
-                landmarks = face_landmarks.landmark
-                left_ear = self.calculate_ear(self.LEFT_EYE, landmarks, image_width, image_height)
-                right_ear = self.calculate_ear(self.RIGHT_EYE, landmarks, image_width, image_height)
-                current_ear = (left_ear + right_ear) / 2.0
-                
-                if current_ear > 0.19:
-                    self.ear_history.append(current_ear)
-                    if len(self.ear_history) > self.MAX_HISTORY_LEN:
-                        self.ear_history.pop(0)
-                
-                if len(self.ear_history) >= 20:
-                    baseline_ear = float(np.mean(self.ear_history))
-                    dynamic_threshold = baseline_ear * self.EAR_DROP_RATIO
-                else:
-                    baseline_ear = current_ear
-                    dynamic_threshold = self.FALLBACK_EAR_THRESHOLD
-                
-                if current_ear < dynamic_threshold:
-                    self.drowsy_counter += 1
-                    if self.drowsy_counter >= self.CONSEC_FRAMES:
-                        self.is_drowsy = True
-                else:
-                    self.drowsy_counter = 0
-                    self.is_drowsy = False
+        # --- ポーズ検知（4大ポーズ & フレームスキップ間引き） ---
+        self.pose_frame_counter += 1
+        if self.pose_frame_counter >= self.POSE_SKIP_FRAMES:
+            self.pose_frame_counter = 0
+            pose_results = self.pose_detector.process(rgb_frame)
         else:
-            self.drowsy_counter = 0
-            self.is_drowsy = False
+            pose_results = None
 
-        return self.stable_status, face_center_x, updated_angle, self.is_drowsy, current_ear, baseline_ear
+        self.latest_detected_trigger = None
 
-    def draw_status_overlay(self, frame, status, face_center_x, head_angle, is_drowsy, ear_val, baseline_val):
-        cv_recog.rectangle(frame, (10, 10), (360, 140), (0, 0, 0), -1)
+        if pose_results and pose_results.pose_landmarks:
+            self.mp_drawing.draw_landmarks(img2, pose_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+            lm = pose_results.pose_landmarks.landmark
+            
+            # 1. 手を上げる
+            is_hand_raised = (lm[15].y < lm[11].y) or (lm[16].y < lm[12].y)
+            if is_hand_raised:
+                self.counter_hand_raise += 1
+                if self.counter_hand_raise >= self.POSE_THRESHOLD and not self.in_state_hand_raise:
+                    self.latest_detected_trigger = "hand_raised"
+                    self.in_state_hand_raise = True
+            else:
+                self.counter_hand_raise = max(0, self.counter_hand_raise - 2)
+                if self.counter_hand_raise < 5: self.in_state_hand_raise = False
+
+            # 2. 腕組み
+            is_crossed = (lm[15].x < lm[13].x) and (lm[16].x > lm[14].x)
+            is_leveled = abs((lm[15].y - lm[13].y) + (lm[16].y - lm[14].y)) < 0.2
+            if is_crossed and is_leveled:
+                self.counter_arm_fold += 1
+                if self.counter_arm_fold >= self.POSE_THRESHOLD and not self.in_state_arm_fold:
+                    self.latest_detected_trigger = "arm_folded"
+                    self.in_state_arm_fold = True
+            else:
+                self.counter_arm_fold = max(0, self.counter_arm_fold - 2)
+                if self.counter_arm_fold < 5: self.in_state_arm_fold = False
+
+            # --- 3. 座る / 4. 寝る（肩と腰の位置を考慮した高度な判定） ---
+            nose_y = lm[0].y
+            
+            # 肩と腰のY座標の平均を計算（MediaPipeのインデックス: 肩=11,12 / 腰=23,24）
+            shoulder_y = (lm[11].y + lm[12].y) / 2
+            hip_y = (lm[23].y + lm[24].y) / 2
+            
+            # 胴体の縦方向の長さ（上体が起きているほど大きくなり、寝転ぶと小さくなる）
+            torso_height = hip_y - shoulder_y
+
+            # 判定条件の定義
+            # 【座っている】鼻が極端に低くなく、かつ上体が起きている（胴体の縦幅が一定以上ある）
+            is_sit = (0.35 <= nose_y < 0.72) and (torso_height > 0.12)
+            
+            # 【寝ている】鼻の位置が低い、または上体が倒れていて胴体の縦幅が極端に潰れている
+            is_lie = (nose_y >= 0.70) or (torso_height <= 0.12)
+
+            if is_sit:
+                self.counter_sitting += 1
+                self.counter_lying = 0
+                self.in_state_lying = False
+                
+                if self.counter_sitting >= self.POSE_THRESHOLD and not self.in_state_sitting:
+                    self.latest_detected_trigger = "sitting"
+                    self.in_state_sitting = True
+            else:
+                self.counter_sitting = max(0, self.counter_sitting - 2)
+                if self.counter_sitting < 5: self.in_state_sitting = False
+
+            if is_lie:
+                self.counter_lying += 1
+                self.counter_sitting = 0
+                self.in_state_sitting = False
+                
+                if self.counter_lying >= self.POSE_THRESHOLD and not self.in_state_lying:
+                    self.latest_detected_trigger = "lying"
+                    self.in_state_lying = True
+            else:
+                self.counter_lying = max(0, self.counter_lying - 2)
+                if self.counter_lying < 5: self.in_state_lying = False    
+        elif pose_results is None:
+            pass  # スキップ時は状態を維持
+        else:
+            self.counter_hand_raise = max(0, self.counter_hand_raise - 1)
+            self.counter_arm_fold = max(0, self.counter_arm_fold - 1)
+            self.counter_sitting = max(0, self.counter_sitting - 1)
+            self.counter_lying = max(0, self.counter_lying - 1)
+            if self.counter_hand_raise == 0: self.in_state_hand_raise = False
+            if self.counter_arm_fold == 0: self.in_state_arm_fold = False
+            if self.counter_sitting == 0: self.in_state_sitting = False
+            if self.counter_lying == 0: self.in_state_lying = False
+            
+        # ▼【追加】有効な顔（人物名）が認識されている場合のみ、ポーズトリガーを有効にする
+        if self.latest_detected_trigger is not None:
+            if self.stable_status == "None" or self.stable_status == "Unknown":
+                # 顔が認識されていない、またはUnknownの場合はトリガーを破棄する
+                self.latest_detected_trigger = None
+
+        return self.stable_status, face_center_x, updated_angle, self.latest_detected_trigger, img2
+
+#     def draw_status_overlay(self, frame, status, face_center_x, head_angle, trigger):
+#         cv_recog.rectangle(frame, (10, 10), (380, 130), (0, 0, 0), -1)
+#         text = f"STATUS: {status}" if status != "None" else "STATUS: No Face"
+#         color = (0, 255, 0) if status not in ["None", "Unknown"] else (0, 255, 255)
+#         cv_recog.putText(frame, text, (20, 30), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv_recog.LINE_AA)
+#         cv_recog.putText(frame, f"NECK ANGLE: {head_angle} deg", (20, 55), cv_recog.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv_recog.LINE_AA)
+#         
+#         status_str = f"R:{self.counter_hand_raise} F:{self.counter_arm_fold} S:{self.counter_sitting} L:{self.counter_lying}"
+#         cv_recog.putText(frame, status_str, (20, 80), cv_recog.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv_recog.LINE_AA)
+# 
+#         if trigger:
+#             cv_recog.putText(frame, f"TRIGGER: {trigger.upper()}!", (20, 105), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv_recog.LINE_AA)
+#         else:
+#             cv_recog.putText(frame, "Monitoring poses...", (20, 105), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv_recog.LINE_AA)
+
+    def draw_status_overlay(self, frame, status, face_center_x, head_angle, trigger):
+        h, w = frame.shape[:2]
+        footer_height = 80  # テキスト用の下部エリアの高さ
         
+        # 元の映像の下に黒い余白（フッター）を結合する
+        footer = np.zeros((footer_height, w, 3), dtype=np.uint8)
+        combined_frame = np.vstack((frame, footer))
+        
+        # 結合したエリア（下部の黒帯部分）にテキストを描画
         text = f"STATUS: {status}" if status != "None" else "STATUS: No Face"
         color = (0, 255, 0) if status not in ["None", "Unknown"] else (0, 255, 255)
-        cv_recog.putText(frame, text, (20, 35), cv_recog.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv_recog.LINE_AA)
-        cv_recog.putText(frame, f"NECK ANGLE: {head_angle} deg", (20, 60), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv_recog.LINE_AA)
-        cv_recog.putText(frame, f"EAR: {ear_val:.2f} (Base: {baseline_val:.2f})", (20, 85), cv_recog.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv_recog.LINE_AA)
+        cv_recog.putText(combined_frame, text, (15, h + 22), cv_recog.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv_recog.LINE_AA)
+        cv_recog.putText(combined_frame, f"NECK ANGLE: {head_angle} deg", (15, h + 45), cv_recog.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv_recog.LINE_AA)
         
-        if is_drowsy:
-            cv_recog.putText(frame, "DROWSY ALERT!", (20, 115), cv_recog.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv_recog.LINE_AA)
+        status_str = f"R:{self.counter_hand_raise} F:{self.counter_arm_fold} S:{self.counter_sitting} L:{self.counter_lying}"
+        cv_recog.putText(combined_frame, status_str, (15, h + 68), cv_recog.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv_recog.LINE_AA)
+
+        if trigger:
+            cv_recog.putText(combined_frame, f"TRIGGER: {trigger.upper()}!", (210, h + 22), cv_recog.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2, cv_recog.LINE_AA)
         else:
-            cv_recog.putText(frame, "Awake (Relative)", (20, 115), cv_recog.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv_recog.LINE_AA)
-            
-    # 【変更】複数サーボのステータスをまとめて読み出す関数
+            cv_recog.putText(combined_frame, "Monitoring...", (210, h + 22), cv_recog.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv_recog.LINE_AA)
+
+        return combined_frame  # 拡張したフレームを返す
+
     def read_all_servo_statuses(self, servo_ids=[1, 9]):
         servo_statuses = {}
         for servo_id in servo_ids:
             try:
-                # ① 現在負荷 (Address 60, 2 Byte)
                 load_raw, r1, _ = packet_handler.read2ByteTxRx(servo_id, 60)
                 load = (load_raw % 1024) if r1 == COMM_SUCCESS else 0
-
-                # ② 現在電圧 (Address 62, 1 Byte - 0.1V単位)
                 vol_raw, r2, _ = packet_handler.read1ByteTxRx(servo_id, 62)
                 voltage = (vol_raw * 0.1) if r2 == COMM_SUCCESS else 0.0
-
-                # ③ 現在温度 (Address 63, 1 Byte)
                 temp_raw, r3, _ = packet_handler.read1ByteTxRx(servo_id, 63)
                 temperature = temp_raw if r3 == COMM_SUCCESS else 0
-
-                # ④ 動作状態 (Address 66, 1 Byte - 1:駆動中, 0:停止)
                 mov_raw, r4, _ = packet_handler.read1ByteTxRx(servo_id, 66)
                 is_moving = mov_raw if r4 == COMM_SUCCESS else 0
 
                 servo_statuses[str(servo_id)] = {
-                    "load": load,
-                    "voltage": round(voltage, 1),
-                    "temperature": temperature,
-                    "is_moving": is_moving
+                    "load": load, "voltage": round(voltage, 1), "temperature": temperature, "is_moving": is_moving
                 }
             except Exception:
                 servo_statuses[str(servo_id)] = {"load": 0, "voltage": 0.0, "temperature": 0, "is_moving": 0}
@@ -492,7 +500,10 @@ class FaceAndObjectServer:
         cap = FreshFrameReader(STREAM_URL)
         time.sleep(1.0)
         last_send_time = 0
-        send_interval = 0.5
+        send_interval = 0.3
+
+        # DHT11センサーリーダーの初期化
+        dht_reader = DHT11Reader()
 
         while True:
             ret, frame = cap.read()
@@ -500,69 +511,40 @@ class FaceAndObjectServer:
                 time.sleep(0.01)
                 continue
 
-#             status, face_center_x, current_angle, is_drowsy, ear_val, baseline_val = self.recognition_process(frame)
-#             
-#             now = time.time()
-#             if now - last_send_time >= send_interval:
-#                 payload = {
-#                     "name": status, 
-#                     "neck_angle": current_angle,
-#                     "is_drowsy": is_drowsy,
-#                     "ear": round(ear_val, 2),
-#                     "baseline": round(baseline_val, 2)
-#                 }
-#                 self.sock.sendto(json.dumps(payload).encode("utf-8"), (PI_ZERO_IP, ROBOT_UDP_PORT))
-#                 last_send_time = now
+            status, face_center_x, current_angle, trigger, processed_frame = self.recognition_process(frame)
             
-            status, face_center_x, current_angle, is_drowsy, ear_val, baseline_val = self.recognition_process(frame)
-            
-            # 複数サーボのステータスを取得 (ID 1 と ID 9)
             all_servo_status = self.read_all_servo_statuses([1, 9])
+
+            # 🌡️ DHT11センサーから温度と湿度を読み取る
+            temp_val, humidity_val = dht_reader.read()
 
             now = time.time()
             if now - last_send_time >= send_interval:
                 payload = {
                     "name": status, 
                     "neck_angle": current_angle,
-                    "is_drowsy": is_drowsy,
-                    "ear": round(ear_val, 2),
-                    "baseline": round(baseline_val, 2),
-                    "servo_statuses": all_servo_status  # まとめて送信
+                    "pose_trigger": trigger,          # 検出されたポーズトリガー
+                    "servo_statuses": all_servo_status,
+                    "temperature": temp_val,           # 送信データに温度を追加
+                    "humidity": humidity_val           # 送信データに湿度を追加
                 }
                 self.sock.sendto(json.dumps(payload).encode("utf-8"), (PI_ZERO_IP, ROBOT_UDP_PORT))
                 last_send_time = now
     
-            self.draw_status_overlay(frame, status, face_center_x, current_angle, is_drowsy, ear_val, baseline_val)
-            cv_recog.imshow("Grogu Recognition Server", frame)
+            # テキストエリアが下部に結合されたフレームを受け取って表示する
+            display_frame = self.draw_status_overlay(processed_frame, status, face_center_x, current_angle, trigger)
+            
+            cv_recog.imshow("Grogu Recognition Server", display_frame)
             if cv_recog.waitKey(1) & 0xFF == ord("q"):
                 break
-            time.sleep(0.1)
-
+            time.sleep(0.01)
+        
         cap.release()
         cv_recog.destroyAllWindows()
         self.sock.close()
-        
-        if port_handler:
-            port_handler.closePort()
-
-    def calculate_ear(self, eye_landmarks, landmarks, image_width, image_height):
-        pts = []
-        for idx in eye_landmarks:
-            lm = landmarks[idx]
-            pts.append(np.array([lm.x * image_width, lm.y * image_height]))
-        
-        vertical_dist1 = np.linalg.norm(pts[1] - pts[5])
-        vertical_dist2 = np.linalg.norm(pts[2] - pts[4])
-        horizontal_dist = np.linalg.norm(pts[0] - pts[3])
-        
-        if horizontal_dist == 0:
-            return 0.0
-        ear = (vertical_dist1 + vertical_dist2) / (2.0 * horizontal_dist)
-        return ear
-
+        if port_handler: port_handler.closePort()
 
 if __name__ == "__main__":
     threading.Thread(target=start_audio_and_servo_server, daemon=True).start()
-
     server = FaceAndObjectServer()
     server.run()

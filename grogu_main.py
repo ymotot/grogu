@@ -23,7 +23,7 @@ if __name__ == "__main__":
             sys.exit(1)
         
         # ── 2. 引数の有無（True/False）をコントローラーに渡す ──
-        robot = CatRobotController(gemini_api_key=API_KEY, use_mic=False, remote_only_mode=args.remote_only, enable_proactive=True)
+        robot = CatRobotController(gemini_api_key=API_KEY, use_mic=False, remote_only_mode=args.remote_only, enable_proactive=False)
         
         if args.remote_only:
             print("\n--- ⚡ リモコン専用モードで稼働中 ---")

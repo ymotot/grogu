@@ -649,3 +649,100 @@ class CatRobotController:
                 self.is_drowsy_handling = False
 
         threading.Thread(target=_alert_worker, daemon=True).start()
+        
+    def handle_pose_trigger(self, pose_name: str, recognized_name: str = "None"):
+        if self.motion_lock.locked():
+            return
+
+        print(f"🔥 [ポーズ検知アクション] トリガー: {pose_name}, 人物: {recognized_name}")
+
+        # 1. 現在のカメラフレーム（画像）を取得
+        frame = None
+        if hasattr(self, "camera_client") and self.camera_client:
+            with self.camera_client.frame_lock:
+                if self.camera_client.global_frame is not None:
+                    frame = self.camera_client.global_frame.copy()
+
+        # 2. ポーズに応じた日本語の文脈説明を作成
+        pose_desc_map = {
+            "hand_raise": "手を挙げています",
+            "arm_fold": "腕を組んでいます",
+            "sitting": "座っています",
+            "lying": "横になって（寝て）います"
+        }
+        pose_text = pose_desc_map.get(pose_name, "特定のポーズをしています")
+
+        # 3. Geminiに送るプロンプトと画像の準備
+        prompt = (
+            f"【状況】目の前にいる {recognized_name} さんが今、「{pose_text}」というポーズをしました。\n"
+            f"添付した画像（現在のカメラ映像）も確認して、この状況やユーザーの様子に合わせた、"
+            f"グローグーらしいユーモアのあるコメントやツッコミ、または話しかけを考えてください。\n"
+            f"いつも通り、JSON形式（text, sequence, ir_commands）で出力してください。"
+        )
+
+        was_neck_tracking = self.neck_tracking_enabled
+        self.neck_tracking_enabled = False
+
+        try:
+            # OpenCVのBGR画像からPIL Imageに変換
+            contents = [prompt]
+            if frame is not None:
+                import cv2
+                from PIL import Image
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb_frame)
+                contents.append(pil_img)
+
+            # Geminiモデルへのマルチモーダル送信
+            session = self.chat_manager.get_or_create_session(recognized_name)
+            response = session.send_message(contents)
+            res_text = response.text.strip()
+
+            # レスポンスのJSONパース処理
+            import json, re
+            json_match = re.search(r"```(?:json)?\s*({.*?})\s*```", res_text, re.DOTALL)
+            json_str = json_match.group(1) if json_match else res_text
+
+            data = json.loads(json_str)
+            text = data.get("text", "うにゃ？")
+            raw_sequence = data.get("sequence", [])
+            ir_commands = data.get("ir_commands", [])
+
+            formatted_sequence = []
+            for step in raw_sequence:
+                if isinstance(step, list) and len(step) >= 2:
+                    targets = {int(k): float(v) for k, v in step[0].items()}
+                    emotion = step[1] if len(step) > 1 else "Normal"
+                    hold_sec = step[2] if len(step) > 2 else 1.0
+                    formatted_sequence.append((targets, emotion, hold_sec))
+
+            # WebUIのチャットログへ反映
+            if hasattr(self, "camera_client") and self.camera_client:
+                self.camera_client.socketio.emit(
+                    "chat_response",
+                    {"user_text": f"（ポーズ検知: {pose_text}）", "bot_text": text, "recognized": recognized_name}
+                )
+
+            # 家電操作（IR）の要求があれば実行
+            if ir_commands:
+                for cmd in ir_commands:
+                    self.trigger_force_ir(cmd)
+
+            # 表情と動作を伴って発話
+            def apply_motion(targets, emotion):
+                if emotion:
+                    self._apply_eye_emotion(emotion)
+                if targets:
+                    self.move_smooth(targets, steps=30, interval=0.02, auto_off=False)
+
+            self.chat_manager.speak_with_motion(text=text, sequence=formatted_sequence, motion_executor_func=apply_motion)
+
+        except Exception as e:
+            print(f"⚠️ [Pose Trigger AI Error] {e}")
+            import traceback
+            traceback.print_exc()
+            # エラー時のフォールバック動作
+            self.force_action(hold_sec=1.5)
+        finally:
+            self.neck_tracking_enabled = was_neck_tracking
+            self.disable_all()
