@@ -461,6 +461,17 @@ class CatRobotController:
         self.wait_for_neck_settle()
         current_recognized_person = self.camera_client.latest_recognized_name
 
+        # 🌡️ センサーから最新の温湿度を取得し、ユーザー入力のコンテキストに追加する
+        temp = getattr(self.camera_client, "latest_temperature", None)
+        humidity = getattr(self.camera_client, "latest_humidity", None)
+        now_str = time.strftime("%Y年%m月%d日 %H:%M")
+        print(f"🌡️ [デバッグ受信] 温度: {temp}, 湿度: {humidity}")
+        
+        env_context = f"\n[現在日時: {now_str}"
+        if temp is not None and humidity is not None:
+            env_context += f", 室温: {temp:.1f}℃, 湿度: {humidity:.1f}%"
+        env_context += "]"
+
         if any(kw in user_input.lower() for kw in ["距離", "測って", "はかって", "distance"]):
             dist = self.measure_distance_with_right_arm()
             if dist is not None:
@@ -468,8 +479,15 @@ class CatRobotController:
         elif any(kw in user_input.lower() for kw in ["フォース", "force"]):
             self.force_action(hold_sec=2.0)
 
+        # チャットマネージャーに環境情報を含めたプロンプトを送信
+        full_user_message = user_input + env_context
+        
+        # ▼▼【追加】Geminiに送信される内容をコンソールに表示する ▼▼
+        print(f"📤 [Geminiへ送信するメッセージ]: {full_user_message}")
+        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
         reply_text, sequence, ir_commands = self.chat_manager.send_message(
-            user_text=user_input, recognized_name=current_recognized_person
+            user_text=full_user_message, recognized_name=current_recognized_person
         )
 
         self.camera_client.socketio.emit(
@@ -494,7 +512,7 @@ class CatRobotController:
             self.chat_manager.speak_with_motion(text=reply_text, sequence=sequence, motion_executor_func=apply_motion)
         finally:
             self.neck_tracking_enabled = was_neck_tracking
-            self.disable_all()
+            self.disable_all()        
 
     def start_chat_session(self):
         self.chat_active_flag = True
